@@ -1,0 +1,1 @@
+worker: python truth_social_monitor.py
