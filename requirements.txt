@@ -1,3 +1,2 @@
 cloudscraper
 pymongo
-cohere
