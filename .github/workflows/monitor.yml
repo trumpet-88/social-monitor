@@ -2,7 +2,7 @@ name: Monitor Posts
 
 on:
   schedule:
-    - cron: '* * * * *'  # Runs every minute
+    - cron: '*/5 * * * *'
 
 jobs:
   monitor:
