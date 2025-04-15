@@ -3,6 +3,7 @@ import re
 import logging
 import cloudscraper
 from pymongo import MongoClient
+import requests
 
 # Configure logging to show in console
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
@@ -11,14 +12,11 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
-HF_API_TOKEN = os.getenv('HF_API_TOKEN')
+COHERE_API_TOKEN = os.getenv('COHERE_API_TOKEN')
 MONGODB_URI = os.getenv('MONGODB_URI')
 
 # Confidence threshold for actionable signals
 CONFIDENCE_THRESHOLD = 0.80
-
-# Define keywords that you consider "actionable"
-ACTIONABLE_KEYWORDS = ['buy', 'sell', 'stocks', 'tariff', 'sanctions']
 
 # Connect to MongoDB
 client = MongoClient(MONGODB_URI)
@@ -44,7 +42,6 @@ def send_telegram_message(message):
     url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
     payload = {'chat_id': CHAT_ID, 'text': message}
     try:
-        # Use cloudscraper to send the Telegram message
         response = cloudscraper.create_scraper().post(url, data=payload)
         if response.status_code == 200:
             logger.info("Telegram message sent successfully")
@@ -53,41 +50,56 @@ def send_telegram_message(message):
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
-def classify_post(post_text):
-    api_url = 'https://api-inference.huggingface.co/models/facebook/bart-large-mnli'
-    headers = {'Authorization': f'Bearer {HF_API_TOKEN}'}
+def analyze_post_with_cohere_chat(post_text):
+    api_url = 'https://api.cohere.ai/chat'
+    headers = {
+        'Authorization': f'Bearer {COHERE_API_TOKEN}',
+        'Content-Type': 'application/json',
+    }
     payload = {
-        'inputs': post_text,
-        'parameters': {'candidate_labels': ['buy stocks', 'sell stocks', 'neutral']}
+        'message': f"""Classify this Trump tweet into one of the following categories: "bullish," "bearish," or "neutral" based on its potential impact on financial markets. Provide a brief explanation for your classification.
+
+        **Classification Rules**:
+        - **Bullish**: Indicates potential positive market impact (e.g., mentions of economic growth, tax cuts, or market-friendly policies).
+        - **Bearish**: Indicates potential negative market impact (e.g., mentions of tariffs, sanctions, or economic restrictions).
+        - **Neutral**: No significant market impact (e.g., political statements, accusations, or non-economic content).
+
+        **Examples**:
+        - Bullish: "We’re cutting taxes to boost the economy!"
+        - Bearish: "I’m imposing new tariffs on foreign imports."
+        - Neutral: "The Fake News media is at it again!"
+
+        Tweet: '{post_text}'
+
+        Respond in the format:
+        Classification: <bullish/bearish/neutral>
+        Explanation: <brief explanation>""",
+        'model': 'command-r-plus',  # Updated model
+        'temperature': 0.1,
     }
     try:
-        logger.info(f"Classifying post: {post_text[:50]}...")
-        response = cloudscraper.create_scraper().post(api_url, headers=headers, json=payload)
+        logger.info(f"Analyzing post: {post_text[:50]}...")
+        response = requests.post(api_url, headers=headers, json=payload)
         if response.status_code == 200:
             result = response.json()
-            # Ensure we got both labels and scores
-            if isinstance(result, dict) and 'labels' in result and 'scores' in result:
-                label = result['labels'][0]
-                score = result['scores'][0]
-                logger.info(f"Model classified as '{label}' with confidence {score:.2f}")
-                return label, score
+            if 'text' in result:
+                response_text = result['text'].strip()
+                classification, explanation = response_text.split('\n', 1)
+                classification = classification.split(': ')[1].strip().lower()
+                explanation = explanation.split(': ')[1].strip()
+                return classification, explanation, 1.0  # Confidence is fixed for simplicity
             else:
                 logger.error(f"Unexpected API response format: {result}")
-                return None, None
+                return None, None, None
         else:
-            logger.error(f"Hugging Face API error: {response.status_code} - {response.text}")
-            return None, None
+            logger.error(f"Cohere API error: {response.status_code} - {response.text}")
+            return None, None, None
     except Exception as e:
         logger.error(f"API request error: {e}")
-        return None, None
+        return None, None, None
 
 def strip_html(html_content):
-    # Remove any HTML tags from the content.
     return re.sub(r'<[^>]+>', '', html_content).strip()
-
-def contains_actionable_keywords(text):
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in ACTIONABLE_KEYWORDS)
 
 def main():
     logger.info("Starting Truth Social monitor script...")
@@ -98,7 +110,6 @@ def main():
 
     try:
         scraper = cloudscraper.create_scraper()
-        # Set browser-like headers
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "Accept-Language": "en-GB,en;q=0.9",
@@ -125,16 +136,17 @@ def main():
         posts = response.json()
         logger.info(f"Fetched {len(posts)} posts from the API")
 
-        for post in posts:
+        # Process posts in reverse order (newest first)
+        for post in reversed(posts):
             post_id = post.get('id')
             if not post_id:
                 logger.warning("Post missing id, skipping...")
                 continue
 
-            # Skip posts already processed (if available)
-            if last_processed and post_id == last_processed:
-                logger.info("Reached last processed post, stopping...")
-                break
+            # Skip posts already processed
+            if last_processed and post_id <= last_processed:
+                logger.info(f"Post ID {post_id} already processed, skipping...")
+                continue
 
             raw_content = post.get('content', '')
             post_text = strip_html(raw_content)
@@ -144,30 +156,22 @@ def main():
                 continue
 
             logger.info(f"Processing post ID {post_id}: {post_text[:50]}...")
-            label, score = classify_post(post_text)
-            # If classification fails or confidence is too low, do not update mongo
-            if label is None or score is None or score < CONFIDENCE_THRESHOLD:
-                logger.warning(f"Uncertain classification for post ID {post_id} (score: {score}). Will retry next time.")
+            classification, explanation, confidence = analyze_post_with_cohere_chat(post_text)
+
+            if classification is None or explanation is None or confidence < CONFIDENCE_THRESHOLD:
+                logger.warning(f"Uncertain classification for post ID {post_id} (confidence: {confidence}). Will retry next time.")
                 continue
 
-            # If label is 'neutral', mark as processed without alerting
-            if label == 'neutral':
-                logger.info(f"Post ID {post_id} classified as neutral.")
-                update_last_processed(post_id)
-                continue
+            # Log the classification result
+            logger.info(f"Post ID {post_id} classified as **{classification.upper()}**: {explanation}")
 
-            # Optional: ensure the post text has at least one actionable keyword.
-            if not contains_actionable_keywords(post_text):
-                logger.info(f"Post ID {post_id} lacks actionable keywords. Marking as neutral.")
-                update_last_processed(post_id)
-                continue
+            # Only send alerts for bullish or bearish posts
+            if classification in ['bullish', 'bearish']:
+                message = f"{classification.upper()}: {post_text}\nReason: {explanation}"
+                send_telegram_message(message)
+                logger.info(f"Sent alert for post ID {post_id}: {classification.upper()} (confidence {confidence:.2f})")
 
-            # If we've reached here, we consider the post actionable.
-            message = f"{label.upper()}: {post_text}"
-            send_telegram_message(message)
-            logger.info(f"Sent alert for post ID {post_id}: {label} (confidence {score:.2f})")
-
-            # Mark as processed after a successful actionable alert
+            # Update last processed post ID regardless of classification
             update_last_processed(post_id)
 
     except Exception as e:
