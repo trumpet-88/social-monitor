@@ -31,7 +31,7 @@ if GROQ_API_TOKEN is None:
 
 # Allow overriding the base URL / model via ENV for flexibility
 GROQ_BASE_URL = os.getenv("GROQ_API_BASE", "https://api.groq.com/openai/v1")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-70b-8192")
 
 CONFIDENCE_THRESHOLD = 0.80
 
@@ -43,7 +43,6 @@ collection = None
 if MONGODB_URI:
     try:
         client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10_000)
-        # Force connection on a request as the
         client.admin.command("ping")
         db = client["truth_social_monitor"]
         collection = db["last_processed"]
@@ -91,11 +90,17 @@ def send_telegram_message(message: str) -> None:
 # Groq chat completion wrapper
 # -------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "You are a seasoned financial market analyst.  "
-    "Classify Trump posts into: bullish, bearish, or neutral – based on likely market impact.  "
-    "Respond with exactly two lines: 1) 'Classification: <bullish|bearish|neutral>' 2) 'Explanation: <reason>'."
+    "You are a veteran macro‑trader. "
+    "Classify Trump posts strictly into bullish, bearish, or neutral – *only* when a post states a concrete economic action that can realistically move financial markets (e.g., imposing a specific tariff, cutting a tax rate, sanctioning a country/company, directing the Fed, large stimulus bill, etc.). "
+    "If it is political rhetoric, self‑praise, personal attacks, polls, endorsements, or vague goals without a specific economic lever, classify it as NEUTRAL. "
+    "Respond in exactly two lines:\n"
+    "Classification: <bullish|bearish|neutral>\n"
+    "Explanation: <≤20 words>"
 )
-USER_PROMPT_TMPL = """Classify the following Trump post and respond in the required two‑line format.\n\nPost:\n{post}\n"""
+USER_PROMPT_TMPL = (
+    "Classify the following Trump post and respond in the required two‑line format.\n\nPost:\n{post}\n"
+)
+
 
 def analyze_post_with_groq(post_text: str) -> Tuple[Optional[str], Optional[str], float]:
     api_url = f"{GROQ_BASE_URL}/chat/completions"
@@ -105,7 +110,7 @@ def analyze_post_with_groq(post_text: str) -> Tuple[Optional[str], Optional[str]
     }
     payload = {
         "model": GROQ_MODEL,
-        "temperature": 0.1,
+        "temperature": 0.0,  # deterministic output
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TMPL.format(post=post_text)},
