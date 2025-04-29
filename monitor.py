@@ -1,181 +1,210 @@
 import os
 import re
+import sys
+import json
 import logging
-import cloudscraper
-from pymongo import MongoClient
-import requests
+from typing import Tuple, Optional
 
-# Configure logging to show in console
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+import requests
+import cloudscraper
+from pymongo import MongoClient, errors as mongo_errors
+
+# -------------------------------------------------------------
+# Configuration & Environment
+# -------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    force=True,
+)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
-COHERE_API_TOKEN = os.getenv('COHERE_API_TOKEN')
-MONGODB_URI = os.getenv('MONGODB_URI')
+# Environment variables (fail–fast if any critical ones are missing)
+TELEGRAM_TOKEN: Optional[str] = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID: Optional[str] = os.getenv("CHAT_ID")
+GROQ_API_TOKEN: Optional[str] = os.getenv("GROQ_API_TOKEN")
+MONGODB_URI: Optional[str] = os.getenv("MONGODB_URI")
 
-# Confidence threshold for actionable signals
+if GROQ_API_TOKEN is None:
+    logger.critical("GROQ_API_TOKEN is not set – exiting.")
+    sys.exit(1)
+
+# Allow overriding the base URL / model via ENV for flexibility
+GROQ_BASE_URL = os.getenv("GROQ_API_BASE", "https://api.groq.com/openai/v1")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
 CONFIDENCE_THRESHOLD = 0.80
 
-# Connect to MongoDB
-client = MongoClient(MONGODB_URI)
-db = client['truth_social_monitor']
-collection = db['last_processed']
+# -------------------------------------------------------------
+# Database helpers (connect once, fail if unreachable)
+# -------------------------------------------------------------
+client: Optional[MongoClient] = None
+collection = None
+if MONGODB_URI:
+    try:
+        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10_000)
+        # Force connection on a request as the
+        client.admin.command("ping")
+        db = client["truth_social_monitor"]
+        collection = db["last_processed"]
+    except mongo_errors.PyMongoError as err:
+        logger.critical(f"Unable to connect to MongoDB at {MONGODB_URI}: {err}")
+        sys.exit(1)
+else:
+    logger.critical("MONGODB_URI is not set – exiting.")
+    sys.exit(1)
 
-def get_last_processed():
+
+def get_last_processed() -> Optional[str]:
     try:
         doc = collection.find_one()
-        return doc['post_id'] if doc else None
-    except Exception as e:
-        logger.error(f"MongoDB error getting last processed: {e}")
+        return doc["post_id"] if doc else None
+    except mongo_errors.PyMongoError as err:
+        logger.error(f"MongoDB read error: {err}")
         return None
 
-def update_last_processed(post_id):
-    try:
-        collection.update_one({}, {'$set': {'post_id': post_id}}, upsert=True)
-        logger.info(f"Updated last processed post ID to: {post_id}")
-    except Exception as e:
-        logger.error(f"MongoDB error updating last processed: {e}")
 
-def send_telegram_message(message):
-    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
-    payload = {'chat_id': CHAT_ID, 'text': message}
+def update_last_processed(post_id: str) -> None:
     try:
-        response = cloudscraper.create_scraper().post(url, data=payload)
-        if response.status_code == 200:
-            logger.info("Telegram message sent successfully")
-        else:
-            logger.error(f"Failed to send Telegram message: {response.text}")
-    except Exception as e:
-        logger.error(f"Telegram error: {e}")
+        collection.update_one({}, {"$set": {"post_id": post_id}}, upsert=True)
+    except mongo_errors.PyMongoError as err:
+        logger.error(f"MongoDB write error: {err}")
 
-def analyze_post_with_cohere_chat(post_text):
-    api_url = 'https://api.cohere.ai/chat'
+# -------------------------------------------------------------
+# Telegram helper
+# -------------------------------------------------------------
+
+def send_telegram_message(message: str) -> None:
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.warning("Telegram credentials missing – cannot send alert.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
+    try:
+        r = cloudscraper.create_scraper().post(url, data=payload, timeout=15)
+        r.raise_for_status()
+        logger.info("Telegram message sent")
+    except Exception as exc:
+        logger.error(f"Telegram error: {exc}")
+
+# -------------------------------------------------------------
+# Groq chat completion wrapper
+# -------------------------------------------------------------
+SYSTEM_PROMPT = (
+    "You are a seasoned financial market analyst.  "
+    "Classify Trump posts into: bullish, bearish, or neutral – based on likely market impact.  "
+    "Respond with exactly two lines: 1) 'Classification: <bullish|bearish|neutral>' 2) 'Explanation: <reason>'."
+)
+USER_PROMPT_TMPL = """Classify the following Trump post and respond in the required two‑line format.\n\nPost:\n{post}\n"""
+
+def analyze_post_with_groq(post_text: str) -> Tuple[Optional[str], Optional[str], float]:
+    api_url = f"{GROQ_BASE_URL}/chat/completions"
     headers = {
-        'Authorization': f'Bearer {COHERE_API_TOKEN}',
-        'Content-Type': 'application/json',
+        "Authorization": f"Bearer {GROQ_API_TOKEN}",
+        "Content-Type": "application/json",
     }
     payload = {
-        'message': f"""Classify this Trump tweet into one of the following categories: "bullish," "bearish," or "neutral" based on its potential impact on financial markets. Provide a brief explanation for your classification.
-
-        **Classification Rules**:
-        - **Bullish**: Indicates potential positive market impact (e.g., mentions of economic growth, tax cuts, or market-friendly policies).
-        - **Bearish**: Indicates potential negative market impact (e.g., mentions of tariffs, sanctions, or economic restrictions).
-        - **Neutral**: No significant market impact (e.g., political statements, accusations, or non-economic content).
-
-        **Examples**:
-        - Bullish: "We’re cutting taxes to boost the economy!"
-        - Bearish: "I’m imposing new tariffs on foreign imports."
-        - Neutral: "The Fake News media is at it again!"
-
-        Tweet: '{post_text}'
-
-        Respond in the format:
-        Classification: <bullish/bearish/neutral>
-        Explanation: <brief explanation>""",
-        'model': 'command-r-plus',  # Updated model
-        'temperature': 0.1,
+        "model": GROQ_MODEL,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": USER_PROMPT_TMPL.format(post=post_text)},
+        ],
     }
+
     try:
-        logger.info(f"Analyzing post: {post_text[:50]}...")
-        response = requests.post(api_url, headers=headers, json=payload)
-        if response.status_code == 200:
-            result = response.json()
-            if 'text' in result:
-                response_text = result['text'].strip()
-                classification, explanation = response_text.split('\n', 1)
-                classification = classification.split(': ')[1].strip().lower()
-                explanation = explanation.split(': ')[1].strip()
-                return classification, explanation, 1.0  # Confidence is fixed for simplicity
-            else:
-                logger.error(f"Unexpected API response format: {result}")
-                return None, None, None
-        else:
-            logger.error(f"Cohere API error: {response.status_code} - {response.text}")
-            return None, None, None
-    except Exception as e:
-        logger.error(f"API request error: {e}")
-        return None, None, None
+        r = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        if r.status_code != 200:
+            logger.error(
+                f"Groq API {r.status_code}: {r.text[:200]} – payload model={GROQ_MODEL}"
+            )
+            return None, None, 0.0
+        data = r.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        lines = [ln.strip() for ln in content.split("\n") if ln.strip()]
+        if len(lines) < 2:
+            logger.error(f"Unexpected Groq output: {content}")
+            return None, None, 0.0
+        classification = lines[0].split(":", 1)[-1].strip().lower()
+        explanation = lines[1].split(":", 1)[-1].strip()
+        return classification, explanation, 1.0
+    except Exception as exc:
+        logger.error(f"Groq API request error: {exc}")
+        return None, None, 0.0
 
-def strip_html(html_content):
-    return re.sub(r'<[^>]+>', '', html_content).strip()
+# -------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------
 
-def main():
-    logger.info("Starting Truth Social monitor script...")
+def strip_html(html: str) -> str:
+    return re.sub(r"<[^>]+>", "", html or "").strip()
+
+# -------------------------------------------------------------
+# Main
+# -------------------------------------------------------------
+
+def main() -> None:
+    logger.info("Truth Social monitor starting …")
     last_processed = get_last_processed()
-    logger.info(f"Last processed post ID: {last_processed}")
 
-    api_url = 'https://truthsocial.com/api/v1/accounts/107780257626128497/statuses?exclude_replies=true&only_replies=false&with_muted=true'
+    api_url = (
+        "https://truthsocial.com/api/v1/accounts/107780257626128497/"
+        "statuses?exclude_replies=true&only_replies=false&with_muted=true"
+    )
 
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; TruthMonitor/1.0)",
+        "Cache-Control": "no-cache",
+    }
+
+    scraper = cloudscraper.create_scraper()
     try:
-        scraper = cloudscraper.create_scraper()
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Language": "en-GB,en;q=0.9",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36",
-            "sec-ch-ua": "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "\"macOS\"",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Upgrade-Insecure-Requests": "1",
-            "Referer": "https://truthsocial.com/"
-        }
-
-        logger.info(f"Fetching posts from API: {api_url}")
-        response = scraper.get(api_url, headers=headers)
+        response = scraper.get(api_url, headers=headers, timeout=30)
         if response.status_code != 200:
-            logger.error(f"Error fetching posts: {response.status_code} - {response.text}")
-            return
+            logger.critical(
+                f"Truth Social API HTTP {response.status_code}: {response.text[:200]}"
+            )
+            sys.exit(1)
+        try:
+            posts = response.json()
+        except json.JSONDecodeError as je:
+            logger.critical(f"Truth Social response is not JSON: {je}")
+            sys.exit(1)
+    except Exception as exc:
+        logger.critical(f"Error fetching Truth Social posts: {exc}")
+        sys.exit(1)
 
-        posts = response.json()
-        logger.info(f"Fetched {len(posts)} posts from the API")
+    logger.info(f"Fetched {len(posts)} posts …")
 
-        # Process posts in reverse order (newest first)
-        for post in reversed(posts):
-            post_id = post.get('id')
-            if not post_id:
-                logger.warning("Post missing id, skipping...")
-                continue
+    for post in reversed(posts):
+        post_id = post.get("id")
+        if not post_id:
+            continue
+        if last_processed and post_id <= last_processed:
+            logger.info(f"{post_id} already processed")
+            continue
 
-            # Skip posts already processed
-            if last_processed and post_id <= last_processed:
-                logger.info(f"Post ID {post_id} already processed, skipping...")
-                continue
-
-            raw_content = post.get('content', '')
-            post_text = strip_html(raw_content)
-            if not post_text:
-                logger.warning(f"No text content for post ID {post_id}, skipping...")
-                update_last_processed(post_id)
-                continue
-
-            logger.info(f"Processing post ID {post_id}: {post_text[:50]}...")
-            classification, explanation, confidence = analyze_post_with_cohere_chat(post_text)
-
-            if classification is None or explanation is None or confidence < CONFIDENCE_THRESHOLD:
-                logger.warning(f"Uncertain classification for post ID {post_id} (confidence: {confidence}). Will retry next time.")
-                continue
-
-            # Log the classification result
-            logger.info(f"Post ID {post_id} classified as **{classification.upper()}**: {explanation}")
-
-            # Only send alerts for bullish or bearish posts
-            if classification in ['bullish', 'bearish']:
-                message = f"{classification.upper()}: {post_text}\nReason: {explanation}"
-                send_telegram_message(message)
-                logger.info(f"Sent alert for post ID {post_id}: {classification.upper()} (confidence {confidence:.2f})")
-
-            # Update last processed post ID regardless of classification
+        post_text = strip_html(post.get("content", ""))
+        if not post_text:
+            logger.debug(f"Post {post_id} has no text – skipped.")
             update_last_processed(post_id)
+            continue
 
-    except Exception as e:
-        logger.error(f"Error in main: {e}")
+        classification, explanation, conf = analyze_post_with_groq(post_text)
+        if classification is None or conf < CONFIDENCE_THRESHOLD:
+            logger.warning(f"Could not classify post {post_id}; will retry later.")
+            continue
 
-if __name__ == '__main__':
+        logger.info(f"Post {post_id}: {classification.upper()} – {explanation}")
+        if classification in {"bullish", "bearish"}:
+            send_telegram_message(
+                f"{classification.upper()}: {post_text}\nReason: {explanation}"
+            )
+        update_last_processed(post_id)
+
+    logger.info("Run completed successfully.")
+
+
+if __name__ == "__main__":
     main()
