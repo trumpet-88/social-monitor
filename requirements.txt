@@ -1,2 +1,3 @@
 cloudscraper
 pymongo
+free-proxy
