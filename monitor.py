@@ -3,7 +3,7 @@
 Truth-Social market-signal monitor
 ──────────────────────────────────
  • Cloudflare-aware (Cloudscraper + rotating UA)
- • Auto-picks a free proxy (GitHub raw lists ➜ free-proxy fallback)
+ • Auto-picks a free proxy (FreeProxy first ➜ GitHub raw lists fallback)
  • If proxy stalls → instantly switches to a fresh one / direct
  • Loud, timestamped logging at every step
 """
@@ -87,8 +87,24 @@ def _proxy_works(proxy: str) -> bool:
 
 
 def _pick_free_proxy() -> Optional[str]:
-    """Try GitHub raw lists, then free-proxy fallback. Hard-stop after _PICKER_TIMEOUT."""
+    """Try FreeProxy first, then GitHub raw lists. Hard-stop after _PICKER_TIMEOUT."""
     start = time.time()
+
+    # ── FIRST, try the FreeProxy fallback ───────────────────────────────────
+    if FreeProxy:
+        try:
+            proxy = FreeProxy(
+                timeout=_TEST_TIMEOUT,
+                rand=True,
+                anonym=True,
+                elite=True,
+                https=True
+            ).get()
+            if proxy and _proxy_works(proxy):
+                logger.info(f"Free-proxy gave working proxy {proxy}")
+                return proxy if "://" in proxy else f"http://{proxy}"
+        except Exception as exc:
+            logger.debug(f"free-proxy initial fallback failed: {exc}")
 
     def timed_out() -> bool:
         return time.time() - start > _PICKER_TIMEOUT
@@ -112,17 +128,6 @@ def _pick_free_proxy() -> Optional[str]:
                         return proxy if "://" in proxy else f"http://{proxy}"
         except Exception as exc:
             logger.debug(f"Proxy source {url} failed: {exc}")
-
-    # ── free-proxy fallback ───────────────────────────────────
-    if not timed_out() and FreeProxy:
-        logger.info("Trying free-proxy fallback …")
-        try:
-            proxy = FreeProxy(timeout=_TEST_TIMEOUT, rand=True, anonym=True, elite=True, https=True).get()
-            if proxy and _proxy_works(proxy):
-                logger.info(f"Free-proxy gave working proxy {proxy}")
-                return proxy
-        except Exception as exc:
-            logger.debug(f"free-proxy error: {exc}")
 
     return None
 
@@ -168,6 +173,7 @@ def update_last_processed(post_id: str) -> None:
     except mongo_errors.PyMongoError as err:
         logger.error(f"MongoDB write error: {err}")
 
+
 # ──────────────────────────────────────────────────────────────
 # Cloudscraper factory
 # ──────────────────────────────────────────────────────────────
@@ -206,7 +212,7 @@ BASE_HEADERS = {
 }
 
 
-def fetch_json_with_retries(url: str, max_retries: int = 3, timeout: int = 25):
+def fetch_json_with_retries(url: str, max_retries: int = 5, timeout: int = 25):
     global PROXY_URL
     backoff = 5
     attempt = 1
@@ -226,11 +232,10 @@ def fetch_json_with_retries(url: str, max_retries: int = 3, timeout: int = 25):
             resp.raise_for_status()
         except (json.JSONDecodeError, requests.RequestException) as exc:
             logger.warning(f"{exc} – backoff {backoff}s")
-            # if we were on a proxy → drop it & pick a fresh one
-            if PROXY_URL:
-                logger.warning(f"Discarding proxy {PROXY_URL}")
-                PROXY_URL = _pick_free_proxy()
-                logger.info(f"New proxy: {PROXY_URL or 'none'}")
+            # drop any existing proxy & pick a fresh one (even if we had none)
+            logger.warning(f"Discarding proxy {PROXY_URL}")
+            PROXY_URL = _pick_free_proxy()
+            logger.info(f"New proxy after failure: {PROXY_URL or 'none, will try direct'}")
             time.sleep(backoff)
             backoff *= 2
             attempt += 1
@@ -256,14 +261,21 @@ def send_telegram_message(message: str) -> None:
     except Exception as exc:
         logger.error(f"Telegram error: {exc}")
 
+
 # ──────────────────────────────────────────────────────────────
 # Groq chat completion
 # ──────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
-    "You are a veteran macro-trader and rigorous policy analyst. For the single Trump post provided, do the following:\n"
+    "You are a veteran macro-trader and rigorous policy analyst.\n"
+    "**Definitions:**\n"
+    "- BULLISH: a policy action likely to **boost** economic growth or markets (e.g. tax cuts, tariffs to protect domestic industry).\n"
+    "- BEARISH: a policy action likely to **weigh on** growth or markets (e.g. tax hikes, restrictive trade measures).\n"
+    "- NEUTRAL: anything else (blame, vague rhetoric, unquantified forecasts).\n"
+    "\n"
+    "For the single Trump post provided, do the following:\n"
     "1. **Rhetorical Audit**: List any blame, misleading claims, vague forecasts, hyperbole, or falsehoods (these are NOT policy actions).\n"
     "2. **Policy Extraction**: List only **specific, quantifiable** economic actions (e.g. “15% tariff on steel imports,” “cut corporate tax from 21% to 15%,” “authorize $500 billion infrastructure bill”).\n"
-    "3. **Self‐Critique**: Review each extracted bullet—discard any lacking a clear % or $ amount or an explicit legislative reference.\n"
+    "3. **Self-Critique**: Review each extracted bullet—discard any lacking a clear % or $ amount or an explicit legislative reference.\n"
     "4. **Classification**: Based *solely* on the remaining bullets, output exactly two lines:\n"
     "   Classification: <bullish|bearish|neutral>\n"
     "   Explanation: ≤20 words, citing the precise lever(s).\n"
