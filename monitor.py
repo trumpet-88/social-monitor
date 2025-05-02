@@ -246,7 +246,7 @@ def send_telegram_message(message: str) -> None:
         logger.warning("Telegram credentials missing – cannot send alert.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
+    payload = {"chat_id": -1002583749311, "text": message}
     try:
         scraper = make_scraper()
         r = scraper.post(url, data=payload, timeout=15)
