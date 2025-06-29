@@ -45,7 +45,8 @@ if not GROQ_API_TOKEN:
     sys.exit(1)
 
 GROQ_BASE_URL = os.getenv("GROQ_API_BASE", "https://api.groq.com/openai/v1")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "deepseek-r1-distill-llama-70b")
+# Switched to a more powerful, instruction-following model available on Groq.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-70b-8192")
 CONFIDENCE_THRESHOLD = 0.80
 
 MONGODB_URI = os.getenv("MONGODB_URI")
@@ -53,36 +54,45 @@ MANUAL_PROXY = os.getenv("PROXY_URL")       # optional user-supplied proxy
 CF_CLEARANCE = os.getenv("CF_CLEARANCE")    # optional Cloudflare cookie
 
 # ──────────────────────────────────────────────────────────────
-# Prompt (updated per user spec)
+# Prompt (REVISED FOR ACCURACY)
 # ──────────────────────────────────────────────────────────────
+# This prompt has been significantly enhanced to reduce false positives by forcing
+# the model to follow a strict, multi-step analysis.
 SYSTEM_PROMPT = (
-    "You are a veteran macro-trader and rigorous policy analyst.\n"
-    "**Definitions:**\n"
-    "- BULLISH: policy action likely to **boost** growth or markets (e.g. tax cuts, tariffs to protect domestic industry).\n"
-    "- BEARISH: policy action likely to **weigh on** growth or markets (e.g. tax hikes, restrictive trade measures).\n"
-    "- NEUTRAL: anything else (blame, vague rhetoric, unquantified forecasts).\n"
-    "\n"
-    "For the single Trump post provided, do the following:\n"
-    "1. **Rhetorical Audit** – list blame, misleading claims, vague forecasts, hyperbole, or falsehoods (these are **not** policy actions).\n"
-    "2. **Policy Extraction** – list only **specific, quantifiable** economic actions (e.g. “15 % tariff on steel imports,” “cut corporate tax from 21 % to 15 %,” “authorize $500 b infrastructure bill”).\n"
-    "3. **Self-Critique** – drop any extracted bullet lacking a clear % or $ amount or an explicit legislative reference.\n"
-    "4. **Classification** – based *solely* on the remaining bullets, output exactly two lines:\n"
-    "   Classification: <bullish|bearish|neutral>\n"
-    "   Explanation: ≤ 20 words citing the precise lever(s).\n"
-    "   If **no** bullets remain after critique, Classification must be NEUTRAL.\n"
-    "\n"
-    "— Examples —\n"
-    "Post: “Impose a 15% tariff on Chinese EVs.”\n"
-    "Audit: no rhetoric to ignore\n"
-    "Extract: 15% tariff on Chinese EVs\n"
-    "Critique: keeps “15% tariff on Chinese EVs” (valid number)\n"
-    "Classification: BULLISH\n"
-    "\n"
-    "Post: “They left us with bad numbers, but boom is coming. Be patient!”\n"
-    "Audit: blame (“they left us with bad numbers”), vague forecast (“boom is coming”)\n"
-    "Extract: (none)\n"
-    "Critique: —\n"
-    "Classification: NEUTRAL"
+    "You are a highly skeptical and rigorous financial analyst specializing in political risk. "
+    "Your single task is to identify immediate, credible, and market-moving economic policy "
+    "actions announced by Donald Trump in a given post.\n\n"
+    "**Your analysis must follow these five steps strictly:**\n\n"
+    "1.  **Policy Extraction:**\n"
+    "    * Identify ONLY specific, quantifiable, and actionable economic policy proposals.\n"
+    "    * Examples of valid policies: 'I am signing an executive order to place a 10% tariff on all imported goods,' "
+    "'We will cut the corporate tax rate to 15%.'\n"
+    "    * Extract these as potential policy bullets. If none, the post is NEUTRAL.\n\n"
+    "2.  **Actor & Authority Test:**\n"
+    "    * For each extracted bullet, confirm the actor is Donald Trump or his administration with the direct authority to implement it.\n"
+    "    * DISCARD any bullet that is:\n"
+    "        * **Criticism of others:** e.g., 'Jerome Powell should lower rates.' (Trump can't force him).\n"
+    "        * **Ascribing intent to opponents:** e.g., 'The Democrats want to raise your taxes by 68%.'\n"
+    "        * **A conditional threat/promise:** e.g., 'If this bill doesn't pass, taxes will rise.'\n"
+    "        * **A call to action for others:** e.g., 'Congress must pass this bill.'\n\n"
+    "3.  **Rhetoric & Reality Check:**\n"
+    "    * Examine the remaining bullets.\n"
+    "    * DISCARD any bullet that is clearly:\n"
+    "        * **Rhetorical Blame or Praise:** Blaming past administrations, praising his own unquantified achievements.\n"
+    "        * **Vague Hyperbole:** 'A boom is coming,' 'We will have the best economy ever.'\n"
+    "        * **Fundraising or Gimmickry:** e.g., Selling 'Trump Cards' for fantastical sums of money. This is not fiscal policy.\n\n"
+    "4.  **Final Classification:**\n"
+    "    * Review the bullets that survived all prior steps.\n"
+    "    * If **zero** bullets remain, the classification MUST be **NEUTRAL**.\n"
+    "    * If bullets remain, classify based on the following strict definitions:\n"
+    "        * **BULLISH:** A specific action likely to immediately **boost** broad market indices (e.g., tax cuts, deregulation, lifting tariffs).\n"
+    "        * **BEARISH:** A specific action likely to immediately **weigh on** broad market indices (e.g., new tariffs, escalating military/trade conflicts).\n"
+    "        * **NEUTRAL:** Anything else. This is the default.\n\n"
+    "5.  **Output Format:**\n"
+    "    * You MUST provide your response in exactly two lines, and nothing else.\n"
+    "    * Line 1: `Classification: <BULLISH|BEARISH|NEUTRAL>`\n"
+    "    * Line 2: `Explanation: <A justification of ≤ 20 words based *only* on the surviving policy bullets.>`\n"
+    "    * If NEUTRAL, the explanation should state why (e.g., 'Political rhetoric with no specific policy action.')."
 )
 USER_PROMPT_TMPL = (
     "Classify the following Trump post and respond in the required two-line format.\n\nPost:\n{post}\n"
@@ -246,7 +256,7 @@ def send_telegram_message(message: str) -> None:
         logger.warning("Telegram credentials missing – cannot send alert.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": -1002583749311, "text": message}
+    payload = {"chat_id": CHAT_ID, "text": message}
     try:
         scraper = make_scraper()
         r = scraper.post(url, data=payload, timeout=15)
@@ -319,6 +329,7 @@ def main() -> None:
     posts = fetch_json_with_retries(api_url)
     logger.info(f"Fetched {len(posts)} posts")
 
+    # Process oldest to newest to maintain order
     for post in reversed(posts):
         post_id = post.get("id")
         if not post_id:
@@ -333,15 +344,16 @@ def main() -> None:
             update_last_processed(post_id)
             continue
 
+        logger.info(f"Analyzing post {post_id}...")
         classification, explanation, conf = analyze_post_with_groq(post_text)
         if classification is None or conf < CONFIDENCE_THRESHOLD:
             logger.warning(f"Could not classify post {post_id}; will retry later.")
             continue
 
-        logger.info(f"{post_id}: {classification.upper()} – {explanation}")
+        logger.info(f"Result for {post_id}: {classification.upper()} – {explanation}")
         if classification in {"bullish", "bearish"}:
             send_telegram_message(
-                f"{classification.upper()}: {post_text}\nReason: {explanation}"
+                f"{classification.upper()}: {post_text}\n\nReason: {explanation}"
             )
         update_last_processed(post_id)
 
